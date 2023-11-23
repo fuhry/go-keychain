@@ -18,6 +18,7 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/rsa"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"runtime"
@@ -161,7 +162,21 @@ var SecClassKey = attrKey(C.CFTypeRef(C.kSecClass))
 var secClassTypeRef = map[SecClass]C.CFTypeRef{
 	SecClassGenericPassword:  C.CFTypeRef(C.kSecClassGenericPassword),
 	SecClassInternetPassword: C.CFTypeRef(C.kSecClassInternetPassword),
+	SecClassCertificate:      C.CFTypeRef(C.kSecClassCertificate),
 	SecClassIdentity:         C.CFTypeRef(C.kSecClassIdentity),
+	SecClassCryptoKey:        C.CFTypeRef(C.kSecClassKey),
+}
+
+func SecClassFromLiteral(v C.CFTypeRef) (SecClass, error) {
+	vs := CFStringToString(C.CFStringRef(v))
+	for sc, mv := range secClassTypeRef {
+		mvs := CFStringToString(C.CFStringRef(mv))
+		if vs == mvs {
+			return sc, nil
+		}
+	}
+
+	return SecClass(0), fmt.Errorf("unrecognized SecClass %q", vs)
 }
 
 var SecKeyTypeKey = attrKey(C.CFTypeRef(C.kSecAttrKeyType))
@@ -207,6 +222,7 @@ const (
 	RSASignatureDigestPSSSHA256      SecKeyAlgorithm = "rsaSignatureDigestPSSSHA256"
 	RSASignatureDigestPSSSHA384      SecKeyAlgorithm = "rsaSignatureDigestPSSSHA384"
 	RSASignatureDigestPSSSHA512      SecKeyAlgorithm = "rsaSignatureDigestPSSSHA512"
+
 	// ECDSA algorithms
 	ECDSASignatureDigestX962SHA1   SecKeyAlgorithm = "ecdsaSignatureDigestX962SHA1"
 	ECDSASignatureDigestX962SHA256 SecKeyAlgorithm = "ecdsaSignatureDigestX962SHA256"
@@ -261,6 +277,8 @@ var (
 	AccountKey = attrKey(C.CFTypeRef(C.kSecAttrAccount))
 	// AccessGroupKey is for kSecAttrAccessGroup
 	AccessGroupKey = attrKey(C.CFTypeRef(C.kSecAttrAccessGroup))
+	// ApplicationTag is for kSecAttrApplicationTag
+	ApplicationTag = attrKey(C.CFTypeRef(C.kSecAttrApplicationTag))
 	// DataKey is for kSecValueData
 	DataKey = attrKey(C.CFTypeRef(C.kSecValueData))
 	// DescriptionKey is for kSecAttrDescription
@@ -271,12 +289,27 @@ var (
 	CreationDateKey = attrKey(C.CFTypeRef(C.kSecAttrCreationDate))
 	// ModificationDateKey is for kSecAttrModificationDate
 	ModificationDateKey = attrKey(C.CFTypeRef(C.kSecAttrModificationDate))
+	// TypeKey is for kSecAttrType
+	TypeKey = attrKey(C.CFTypeRef(C.kSecAttrType))
 
 	TokenIDKey = attrKey(C.CFTypeRef(C.kSecAttrTokenID))
 	// KeySizeInBitsKey is for kSecAttrKeySizeInBits
 	KeySizeInBitsKey = attrKey(C.CFTypeRef(C.kSecAttrKeySizeInBits))
 	// PrivateKeyAttrsKey is for kSecPrivateKeyAttrs
 	PrivateKeyAttrsKey = attrKey(C.CFTypeRef(C.kSecPrivateKeyAttrs))
+	// PublicKeyHashKey is for kSecPublicKeyHashItemAttr
+	PublicKeyHashKey = "pkhh"
+	// PublicKeyHashKey = attrKeyI(C.kSecPublicKeyHashItemAttr)
+	// SubjectKeyIdentifierKey is for kSecSubjectKeyIdentifierItemAttr
+	SubjectKeyIdentifierKey = attrKeyI(C.kSecSubjectKeyIdentifierItemAttr)
+	KeyLabelKey             = "klbl"
+	CanEncryptFlag          = "encr"
+	CanDecryptFlag          = "decr"
+	CanDeriveFlag           = "drve"
+	CanSignFlag             = "sign"
+	CanVerifyFlag           = "vrfy"
+	CanWrapFlag             = "wrap"
+	CanUnwrapFlag           = "unwp"
 )
 
 // Synchronizable is the items synchronizable status
@@ -575,6 +608,7 @@ type QueryResult struct {
 	CreationDate     time.Time
 	ModificationDate time.Time
 	Comment          string
+	Type             SecClass
 
 	// For generic application items
 	Service string
@@ -593,8 +627,10 @@ type QueryResult struct {
 	Data        []byte
 
 	// Certificates
-	Certificate    *CertificateRef
-	HasCertificate bool
+	Certificate          *CertificateRef
+	HasCertificate       bool
+	PublicKeyHash        []byte
+	SubjectKeyIdentifier []byte
 
 	// Identity
 	Identity    *IdentityRef
@@ -602,9 +638,20 @@ type QueryResult struct {
 	TokenID     string
 
 	// Keys
-	Key     *KeyRef
-	HasKey  bool
-	KeyType string
+	Key             *KeyRef
+	HasKey          bool
+	KeyType         string
+	KeyLabel        []byte
+	KeyCapabilities KeyCapabilities
+}
+type KeyCapabilities struct {
+	CanEncrypt bool
+	CanDecrypt bool
+	CanDerive  bool
+	CanSign    bool
+	CanVerify  bool
+	CanWrap    bool
+	CanUnwrap  bool
 }
 
 // QueryItemRef returns query result as CFTypeRef. You must release it when you are done.
@@ -681,9 +728,16 @@ func attrKey(ref C.CFTypeRef) string {
 	return CFStringToString(C.CFStringRef(ref))
 }
 
+func attrKeyI(ref C.uint32) string {
+	a := make([]byte, 4)
+	binary.BigEndian.PutUint32(a, uint32(ref))
+	return string(a)
+}
+
 func convertResult(d C.CFDictionaryRef, sc SecClass) (*QueryResult, error) {
 	m := CFDictionaryToMap(d)
 	result := QueryResult{}
+	unhandledKeys := make([]string, 0)
 	for k, v := range m {
 		key := attrKey(k)
 		switch key {
@@ -746,17 +800,66 @@ func convertResult(d C.CFDictionaryRef, sc SecClass) (*QueryResult, error) {
 		case ModificationDateKey:
 			result.ModificationDate = CFDateToTime(C.CFDateRef(v))
 		case SecKeyTypeKey:
-			enumStr := CFKeyTypeEnumToString(C.CFNumberRef(v))
+			enumStr := CFStringToString(C.CFStringRef(v))
+			// enumStr := CFKeyTypeEnumToString(C.CFNumberRef(v))
 			keyType, ok := keyTypeEnumToString[enumStr]
 			if !ok {
 				return nil, fmt.Errorf("unhandled key type in kSecAttrKeyType: %v", enumStr)
 			} else {
 				result.KeyType = keyType
 			}
-			// default:
-			// 	log.Printf("Unhandled key in conversion: %v\n", key)
+		case PublicKeyHashKey:
+			b, err := CFDataToBytes(C.CFDataRef(v))
+			if err != nil {
+				return nil, err
+			}
+			result.PublicKeyHash = b
+		case SubjectKeyIdentifierKey:
+			b, err := CFDataToBytes(C.CFDataRef(v))
+			if err != nil {
+				return nil, err
+			}
+			result.SubjectKeyIdentifier = b
+		case SecClassKey:
+			b, err := SecClassFromLiteral(v)
+			if err != nil {
+				return nil, err
+			}
+			result.Type = b
+		case KeyLabelKey:
+			b, err := CFDataToBytes(C.CFDataRef(v))
+			if err != nil {
+				return nil, err
+			}
+			result.KeyLabel = b
+		case CanEncryptFlag:
+			v := CFNumberToInterface(C.CFNumberRef(v)).(uint8)
+			result.KeyCapabilities.CanEncrypt = v == 1
+		case CanDecryptFlag:
+			v := CFNumberToInterface(C.CFNumberRef(v)).(uint8)
+			result.KeyCapabilities.CanDecrypt = v == 1
+		case CanDeriveFlag:
+			v := CFNumberToInterface(C.CFNumberRef(v)).(uint8)
+			result.KeyCapabilities.CanDerive = v == 1
+		case CanSignFlag:
+			v := CFNumberToInterface(C.CFNumberRef(v)).(uint8)
+			result.KeyCapabilities.CanSign = v == 1
+		case CanVerifyFlag:
+			v := CFNumberToInterface(C.CFNumberRef(v)).(uint8)
+			result.KeyCapabilities.CanVerify = v == 1
+		case CanWrapFlag:
+			v := CFNumberToInterface(C.CFNumberRef(v)).(uint8)
+			result.KeyCapabilities.CanWrap = v == 1
+		case CanUnwrapFlag:
+			v := CFNumberToInterface(C.CFNumberRef(v)).(uint8)
+			result.KeyCapabilities.CanUnwrap = v == 1
+
+		default:
+			unhandledKeys = append(unhandledKeys, key)
 		}
 	}
+	// log.Printf("finished converting: %+v\n", result)
+	// log.Printf("unhandled keys: %+v\n", unhandledKeys)
 	return &result, nil
 }
 
@@ -1037,7 +1140,7 @@ func (key *KeyRef) SignWithAlgorithm(digest []byte, algo SecKeyAlgorithm) ([]byt
 	return sig, nil
 }
 
-// Sign creates the cryptographic signature for the digest using private key KeyRef and returns it as a byte slice
+// SignWithHash creates the cryptographic signature for the digest using private key KeyRef and returns it as a byte slice
 func (key *KeyRef) SignWithHash(digest []byte, hash crypto.Hash, publicKey crypto.PublicKey) ([]byte, error) {
 	cfDigest, err := BytesToCFData(digest)
 	defer Release(C.CFTypeRef(cfDigest))
@@ -1045,7 +1148,7 @@ func (key *KeyRef) SignWithHash(digest []byte, hash crypto.Hash, publicKey crypt
 		return nil, err
 	}
 
-	algo, err := getAlgo(publicKey, hash)
+	algo, err := getSigningAlgo(publicKey, hash)
 	if err != nil {
 		return nil, err
 	}
@@ -1068,6 +1171,99 @@ func (key *KeyRef) SignWithHash(digest []byte, hash crypto.Hash, publicKey crypt
 	}
 
 	return sig, nil
+}
+
+// Encrypt encrypts data using public (or private) key KeyRef and returns it as a byte slice
+func (key *KeyRef) Encrypt(plaintext []byte, publicKey crypto.PublicKey) ([]byte, error) {
+	cfPlaintext, err := BytesToCFData(plaintext)
+	defer Release(C.CFTypeRef(cfPlaintext))
+	if err != nil {
+		return nil, err
+	}
+
+	algo, err := getEncryptionAlgo(publicKey)
+	if err != nil {
+		return nil, err
+	}
+	// sign the digest
+	var cErr C.CFErrorRef
+
+	//nolint:gocritic//dupSubExpr: suspicious identical LHS and RHS for `==` operator.
+	cCiphertext := C.SecKeyCreateEncryptedData(key.cKeyRef, algo, cfPlaintext, &cErr)
+	if err := CFErrorError(cErr); err != nil {
+		defer Release(C.CFTypeRef(cErr))
+		return nil, err
+	}
+
+	//nolint:gocritic//dupSubExpr: suspicious identical LHS and RHS for `==` operator.
+	defer Release(C.CFTypeRef(cCiphertext))
+
+	ciphertext, err := CFDataToBytes(cCiphertext)
+	if err != nil {
+		return nil, err
+	}
+
+	return ciphertext, nil
+}
+
+// Decrypt decrypts data using private key KeyRef and returns it as a byte slice
+func (key *KeyRef) Decrypt(ciphertext []byte, publicKey crypto.PublicKey) ([]byte, error) {
+	cfCiphertext, err := BytesToCFData(ciphertext)
+	defer Release(C.CFTypeRef(cfCiphertext))
+	if err != nil {
+		return nil, err
+	}
+
+	algo, err := getEncryptionAlgo(publicKey)
+	if err != nil {
+		return nil, err
+	}
+	// sign the digest
+	var cErr C.CFErrorRef
+
+	//nolint:gocritic//dupSubExpr: suspicious identical LHS and RHS for `==` operator.
+	cPlaintext := C.SecKeyCreateDecryptedData(key.cKeyRef, algo, cfCiphertext, &cErr)
+	if err := CFErrorError(cErr); err != nil {
+		defer Release(C.CFTypeRef(cErr))
+		return nil, err
+	}
+
+	//nolint:gocritic//dupSubExpr: suspicious identical LHS and RHS for `==` operator.
+	defer Release(C.CFTypeRef(cPlaintext))
+
+	plaintext, err := CFDataToBytes(cPlaintext)
+	if err != nil {
+		return nil, err
+	}
+
+	return plaintext, nil
+}
+
+// Public gets the crypto.PublicKey corresponding to the private key referenced by this keyRef.
+func (key *KeyRef) Public() ([]byte, error) {
+	var cSecKeyNil C.SecKeyRef
+	cSecKeyPublic := C.SecKeyCopyPublicKey(key.cKeyRef)
+	if cSecKeyPublic == cSecKeyNil {
+		return nil, fmt.Errorf("failed to get public key from keyHandle %+v: SecKeyCopyPublicKey returned nil", key.cKeyRef)
+	}
+
+	var cErr C.CFErrorRef
+
+	cPublicKeyData := C.SecKeyCopyExternalRepresentation(cSecKeyPublic, &cErr)
+	if err := CFErrorError(cErr); err != nil {
+		defer Release(C.CFTypeRef(cErr))
+		return nil, err
+	}
+
+	//nolint:gocritic//dupSubExpr: suspicious identical LHS and RHS for `==` operator.
+	defer Release(C.CFTypeRef(cPublicKeyData))
+
+	pubkey, err := CFDataToBytes(cPublicKeyData)
+	if err != nil {
+		return nil, err
+	}
+
+	return pubkey, nil
 }
 
 func (key *KeyRef) GetPersistentRef() ([]byte, error) {
@@ -1102,8 +1298,8 @@ func (key *KeyRef) Release() {
 	Release(C.CFTypeRef(key.cKeyRef))
 }
 
-// getAlgo decides which algorithm to use with this key type for the given hash.
-func getAlgo(pubKey crypto.PublicKey, hash crypto.Hash) (C.SecKeyAlgorithm, error) {
+// getSigningAlgo decides which algorithm to use with this key type for the given hash.
+func getSigningAlgo(pubKey crypto.PublicKey, hash crypto.Hash) (C.SecKeyAlgorithm, error) {
 	var algo C.SecKeyAlgorithm
 	var err error
 	switch pubKey.(type) {
@@ -1133,6 +1329,22 @@ func getAlgo(pubKey crypto.PublicKey, hash crypto.Hash) (C.SecKeyAlgorithm, erro
 		default:
 			err = fmt.Errorf("unsupported hash")
 		}
+	default:
+		err = fmt.Errorf("unsupported key type: %v", pubKey)
+	}
+
+	return algo, err
+}
+
+// getSigningAlgo decides which algorithm to use with this key type for the given hash.
+func getEncryptionAlgo(pubKey crypto.PublicKey) (C.SecKeyAlgorithm, error) {
+	var algo C.SecKeyAlgorithm
+	var err error
+	switch pubKey.(type) {
+	case *ecdsa.PublicKey:
+		err = fmt.Errorf("ecdsa keys cannot be used for encryption/decryption operations")
+	case *rsa.PublicKey:
+		algo = C.kSecKeyAlgorithmRSAEncryptionPKCS1
 	default:
 		err = fmt.Errorf("unsupported key type: %v", pubKey)
 	}
